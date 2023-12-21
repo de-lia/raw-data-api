@@ -19,88 +19,477 @@
 
 """[Router Responsible for Raw data API ]
 """
-from fastapi import APIRouter, Depends,Request
-from src.galaxy.validation.models import RawDataHistoricalParams , RawDataCurrentParams
-from .auth import login_required
-from src.galaxy.app import RawData
-from fastapi.responses import FileResponse , StreamingResponse
-from datetime import datetime
-import time
-import zipfile
-router = APIRouter(prefix="/raw-data")
-import logging
-import orjson
-import os 
-from starlette.background import BackgroundTasks
-from .auth import login_required
-from src.galaxy import config
-from os.path import exists
 import json
-from uuid import uuid4
-from .auth import login_required
+import os
+import shutil
+import time
 
-logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.DEBUG)
+import requests
+from area import area
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi_versioning import version
+from geojson import FeatureCollection
 
-# @router.post("/historical-snapshot/")
-# def get_historical_data(params:RawDataHistoricalParams):
-#     start_time = time.time()
-#     result= RawData(params).extract_historical_data()
-#     return generate_rawdata_response(result,start_time)
+from src.app import RawData
+from src.config import ALLOW_BIND_ZIP_FILTER, EXPORT_MAX_AREA_SQKM
+from src.config import LIMITER as limiter
+from src.config import RATE_LIMIT_PER_MIN as export_rate_limit
+from src.config import logger as logging
+from src.validation.models import (
+    RawDataCurrentParams,
+    RawDataCurrentParamsBase,
+    SnapshotResponse,
+    StatusResponse,
+)
 
-@router.get("/exports/{file_name}")
-def download_export(file_name: str,background_tasks: BackgroundTasks):
-    """Used for Delivering our export to user , It will hold the zip file until user downloads or hits the url once it is delivered it gets cleared up, Designed as  a separate function to avoid the condition ( waiting for the api response without knowing what is happening on the background )
-    Returns zip file if it is present on our server if not returns null 
+from .api_worker import process_raw_data
+from .auth import AuthUser, UserRole, get_optional_user
+
+router = APIRouter(prefix="", tags=["Extract"])
+
+
+@router.get("/status/", response_model=StatusResponse)
+@version(1)
+def check_database_last_updated():
+    """Gives status about how recent the osm data is , it will give the last time that database was updated completely"""
+    result = RawData().check_status()
+    return {"last_updated": result}
+
+
+@router.post("/snapshot/", response_model=SnapshotResponse)
+@limiter.limit(f"{export_rate_limit}/minute")
+@version(1)
+def get_osm_current_snapshot_as_file(
+    request: Request,
+    params: RawDataCurrentParams = Body(
+        default={},
+        examples={
+            "normal": {
+                "summary": "Example : Extract Evertyhing in the area",
+                "description": "**Query** to Extract everything in the area , You can pass your geometry only and you will get everything on that area",
+                "value": {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [83.96919250488281, 28.194446860487773],
+                                [83.99751663208006, 28.194446860487773],
+                                [83.99751663208006, 28.214869548073377],
+                                [83.96919250488281, 28.214869548073377],
+                                [83.96919250488281, 28.194446860487773],
+                            ]
+                        ],
+                    }
+                },
+            },
+            "fileformats": {
+                "summary": "An example with different file formats and filename",
+                "description": "Raw Data API  can export data into multiple file formats . See outputype for more details",
+                "value": {
+                    "outputType": "shp",
+                    "fileName": "Pokhara_all_features",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [83.96919250488281, 28.194446860487773],
+                                [83.99751663208006, 28.194446860487773],
+                                [83.99751663208006, 28.214869548073377],
+                                [83.96919250488281, 28.214869548073377],
+                                [83.96919250488281, 28.194446860487773],
+                            ]
+                        ],
+                    },
+                },
+            },
+            "filters": {
+                "summary": "An example with filters and geometry type",
+                "description": "Raw Data API  supports different kind of filters on both attributes and tags . See filters for more details",
+                "value": {
+                    "outputType": "geojson",
+                    "fileName": "Pokhara_buildings",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [83.96919250488281, 28.194446860487773],
+                                [83.99751663208006, 28.194446860487773],
+                                [83.99751663208006, 28.214869548073377],
+                                [83.96919250488281, 28.214869548073377],
+                                [83.96919250488281, 28.194446860487773],
+                            ]
+                        ],
+                    },
+                    "filters": {
+                        "tags": {"all_geometry": {"join_or": {"building": []}}},
+                        "attributes": {"all_geometry": ["name"]},
+                    },
+                    "geometryType": ["point", "polygon"],
+                },
+            },
+            "filters2": {
+                "summary": "An example with more filters",
+                "description": "Raw Data API  supports different kind of filters on both attributes and tags . See filters for more details",
+                "value": {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [83.585701, 28.046607],
+                                [83.585701, 28.382561],
+                                [84.391823, 28.382561],
+                                [84.391823, 28.046607],
+                                [83.585701, 28.046607],
+                            ]
+                        ],
+                    },
+                    "fileName": "my export",
+                    "outputType": "geojson",
+                    "geometryType": ["point", "polygon"],
+                    "filters": {
+                        "tags": {
+                            "all_geometry": {
+                                "join_or": {"building": []},
+                                "join_and": {"amenity": ["cafe", "restaurant", "pub"]},
+                            }
+                        },
+                        "attributes": {"all_geometry": ["name", "addr"]},
+                    },
+                },
+            },
+            "allfilters": {
+                "summary": "An example with multiple level of filters",
+                "description": "Raw Data API  supports multiple level of filters on point line polygon . See filters for more details",
+                "value": {
+                    "fileName": "Example export with all features",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [83.585701, 28.046607],
+                                [83.585701, 28.382561],
+                                [84.391823, 28.382561],
+                                [84.391823, 28.046607],
+                                [83.585701, 28.046607],
+                            ]
+                        ],
+                    },
+                    "outputType": "geojson",
+                    "geometryType": ["point", "line", "polygon"],
+                    "filters": {
+                        "tags": {
+                            "point": {
+                                "join_or": {
+                                    "amenity": [
+                                        "bank",
+                                        "ferry_terminal",
+                                        "bus_station",
+                                        "fuel",
+                                        "kindergarten",
+                                        "school",
+                                        "college",
+                                        "university",
+                                        "place_of_worship",
+                                        "marketplace",
+                                        "clinic",
+                                        "hospital",
+                                        "police",
+                                        "fire_station",
+                                    ],
+                                    "building": [
+                                        "bank",
+                                        "aerodrome",
+                                        "ferry_terminal",
+                                        "train_station",
+                                        "bus_station",
+                                        "pumping_station",
+                                        "power_substation",
+                                        "kindergarten",
+                                        "school",
+                                        "college",
+                                        "university",
+                                        "mosque ",
+                                        " church ",
+                                        " temple",
+                                        "supermarket",
+                                        "marketplace",
+                                        "clinic",
+                                        "hospital",
+                                        "police",
+                                        "fire_station",
+                                        "stadium ",
+                                        " sports_centre",
+                                        "governor_office ",
+                                        " townhall ",
+                                        " subdistrict_office ",
+                                        " village_office ",
+                                        " community_group_office",
+                                        "government_office",
+                                    ],
+                                    "man_made": [
+                                        "tower",
+                                        "water_tower",
+                                        "pumping_station",
+                                    ],
+                                    "tower:type": ["communication"],
+                                    "aeroway": ["aerodrome"],
+                                    "railway": ["station"],
+                                    "emergency": ["fire_hydrant"],
+                                    "landuse": ["reservoir", "recreation_gound"],
+                                    "waterway": ["floodgate"],
+                                    "natural": ["spring"],
+                                    "power": ["tower", "substation"],
+                                    "shop": ["supermarket"],
+                                    "leisure": [
+                                        "stadium ",
+                                        " sports_centre ",
+                                        " pitch ",
+                                        " swimming_pool",
+                                        "park",
+                                    ],
+                                    "office": ["government"],
+                                }
+                            },
+                            "line": {
+                                "join_or": {
+                                    "highway": [
+                                        "motorway ",
+                                        " trunk ",
+                                        " primary ",
+                                        " secondary ",
+                                        " tertiary ",
+                                        " service ",
+                                        " residential ",
+                                        " pedestrian ",
+                                        " path ",
+                                        " living_street ",
+                                        " track",
+                                    ],
+                                    "railway": ["rail"],
+                                    "man_made": ["embankment"],
+                                    "waterway": [],
+                                }
+                            },
+                            "polygon": {
+                                "join_or": {
+                                    "amenity": [
+                                        "bank",
+                                        "ferry_terminal",
+                                        "bus_station",
+                                        "fuel",
+                                        "kindergarten",
+                                        "school",
+                                        "college",
+                                        "university",
+                                        "place_of_worship",
+                                        "marketplace",
+                                        "clinic",
+                                        "hospital",
+                                        "police",
+                                        "fire_station",
+                                    ],
+                                    "building": [
+                                        "bank",
+                                        "aerodrome",
+                                        "ferry_terminal",
+                                        "train_station",
+                                        "bus_station",
+                                        "pumping_station",
+                                        "power_substation",
+                                        "power_plant",
+                                        "kindergarten",
+                                        "school",
+                                        "college",
+                                        "university",
+                                        "mosque ",
+                                        " church ",
+                                        " temple",
+                                        "supermarket",
+                                        "marketplace",
+                                        "clinic",
+                                        "hospital",
+                                        "police",
+                                        "fire_station",
+                                        "stadium ",
+                                        " sports_centre",
+                                        "governor_office ",
+                                        " townhall ",
+                                        " subdistrict_office ",
+                                        " village_office ",
+                                        " community_group_office",
+                                        "government_office",
+                                    ],
+                                    "man_made": [
+                                        "tower",
+                                        "water_tower",
+                                        "pumping_station",
+                                    ],
+                                    "tower:type": ["communication"],
+                                    "aeroway": ["aerodrome"],
+                                    "railway": ["station"],
+                                    "landuse": ["reservoir", "recreation_gound"],
+                                    "waterway": [],
+                                    "natural": ["spring"],
+                                    "power": ["substation", "plant"],
+                                    "shop": ["supermarket"],
+                                    "leisure": [
+                                        "stadium ",
+                                        " sports_centre ",
+                                        " pitch ",
+                                        " swimming_pool",
+                                        "park",
+                                    ],
+                                    "office": ["government"],
+                                    "type": ["boundary"],
+                                    "boundary": ["administrative"],
+                                }
+                            },
+                        },
+                        "attributes": {
+                            "point": [
+                                "building",
+                                "ground_floor:height",
+                                "capacity:persons",
+                                "building:structure",
+                                "building:condition",
+                                "name",
+                                "admin_level",
+                                "building:material",
+                                "office",
+                                "building:roof",
+                                "backup_generator",
+                                "access:roof",
+                                "building:levels",
+                                "building:floor",
+                                "addr:full",
+                                "addr:city",
+                                "source",
+                            ],
+                            "line": ["width", "source", "waterway", "name"],
+                            "polygon": [
+                                "landslide_prone",
+                                "name",
+                                "admin_level",
+                                "type",
+                                "is_in:town",
+                                "flood_prone",
+                                "is_in:province",
+                                "is_in:city",
+                                "is_in:municipality",
+                                "is_in:RW",
+                                "is_in:village",
+                                "source",
+                                "boundary",
+                            ],
+                        },
+                    },
+                },
+            },
+        },
+    ),
+    user: AuthUser = Depends(get_optional_user),
+):
+    """Generates the current raw OpenStreetMap data available on database based on the input geometry, query and spatial features.
+
+    Steps to Run Snapshot :
+
+    1.  Post the your request here and your request will be on queue, endpoint will return as following :
+        {
+            "task_id": "your task_id",
+            "track_link": "/tasks/task_id/"
+        }
+    2. Now navigate to /tasks/ with your task id to track progress and result
+
     """
-    zip_temp_path=f"""exports/{file_name}.zip"""
-    if exists(zip_temp_path):
-        response = FileResponse(zip_temp_path,media_type="application/zip")
-        response.headers["Content-Disposition"] = f"attachment; filename={file_name}.zip"
-        # background_tasks.add_task(remove_file, zip_temp_path) #clearing the tmp zip file
-        return response
+    if not (user.role is UserRole.STAFF.value or user.role is UserRole.ADMIN.value):
+        if params.file_name:
+            if "/" in params.file_name:
+                raise HTTPException(
+                    status_code=403,
+                    detail=[
+                        {
+                            "msg": "Insufficient Permission to use folder structure exports , Remove / from filename or get access"
+                        }
+                    ],
+                )
+        area_m2 = area(json.loads(params.geometry.json()))
+        area_km2 = area_m2 * 1e-6
+        RAWDATA_CURRENT_POLYGON_AREA = int(EXPORT_MAX_AREA_SQKM)
+        if area_km2 > RAWDATA_CURRENT_POLYGON_AREA:
+            raise HTTPException(
+                status_code=400,
+                detail=[
+                    {
+                        "msg": f"""Polygon Area {int(area_km2)} Sq.KM is higher than Threshold : {RAWDATA_CURRENT_POLYGON_AREA} Sq.KM"""
+                    }
+                ],
+            )
+        if not params.uuid:
+            raise HTTPException(
+                status_code=403,
+                detail=[{"msg": "Insufficient Permission for uuid = False"}],
+            )
+        if ALLOW_BIND_ZIP_FILTER:
+            if not params.bind_zip:
+                ACCEPTABLE_STREAMING_AREA_SQKM2 = 200
+                if area_km2 > ACCEPTABLE_STREAMING_AREA_SQKM2:
+                    raise HTTPException(
+                        status_code=406,
+                        detail=[
+                            {
+                                "msg": f"Area {area_km2} km2 is greater than {ACCEPTABLE_STREAMING_AREA_SQKM2} km2 which is supported for streaming in this permission"
+                            }
+                        ],
+                    )
 
-def remove_file(path: str) -> None:
-    """Used for removing temp file after zip file is delivered to user
+    queue_name = "recurring_queue" if not params.uuid else "raw_default"
+    task = process_raw_data.apply_async(
+        args=(params,), queue=queue_name, track_started=True
+    )
+    return JSONResponse({"task_id": task.id, "track_link": f"/tasks/status/{task.id}/"})
+
+
+@router.post("/snapshot/plain/", response_model=FeatureCollection)
+@version(1)
+def get_osm_current_snapshot_as_plain_geojson(
+    request: Request,
+    params: RawDataCurrentParamsBase,
+    user: AuthUser = Depends(get_optional_user),
+):
+    """Generates the Plain geojson for the polygon within 30 Sqkm and returns the result right away
+
+    Args:
+        request (Request): _description_
+        params (RawDataCurrentParamsBase): Same as /snapshot excpet multiple output format options and configurations
+
+    Returns:
+        Featurecollection: Geojson
     """
-    os.unlink(path)
+    area_m2 = area(json.loads(params.geometry.json()))
+    area_km2 = area_m2 * 1e-6
+    if area_km2 > 10:
+        raise HTTPException(
+            status_code=400,
+            detail=[
+                {
+                    "msg": f"""Polygon Area {int(area_km2)} Sq.KM is higher than Threshold : 10 Sq.KM"""
+                }
+            ],
+        )
+    params.output_type = "geojson"  # always geojson
+    result = RawData(params).extract_plain_geojson()
+    return result
 
-@router.post("/current-snapshot/")
-def get_current_data(params:RawDataCurrentParams,background_tasks: BackgroundTasks,user_data=Depends(login_required)):  
-# def get_current_data(params:RawDataCurrentParams,background_tasks: BackgroundTasks, user_data=Depends(login_required)):
-    start_time = time.time()
-    logging.debug('Request Received from Raw Data API ')
-    exportname =f"Raw_Export_{datetime.now().isoformat()}_{str(uuid4())}" # unique id for zip file and geojson for each export
-    dump_temp_file,geom_area=RawData(params).extract_current_data(exportname)
-    logging.debug('Zip Binding Started !')
-    #saving file in temp directory instead of memory so that zipping file will not eat memory 
-    zip_temp_path=f"""exports/{exportname}.zip"""
-    zf = zipfile.ZipFile(zip_temp_path, "w" , zipfile.ZIP_DEFLATED)
-    # Compressing geojson file
-    zf.writestr(f"""clipping_boundary.geojson""",orjson.dumps(dict(params.geometry)))
-    zf.write(dump_temp_file)
-    zf.close()
-    Binded_file_size=os.path.getsize(dump_temp_file) # getting file size which is binded into zip
-    logging.debug('Zip Binding Done !')
-    background_tasks.add_task(remove_file, dump_temp_file) # # clearing tmp geojson file since it is already dumped to zip file we don't need it anymore  
-    client_host = dict(config.items("HOST"))['host'] #getting hosting url 
-    client_port = dict(config.items("HOST"))['port'] #getting hosting port
-    download_url=f"""{client_host}:{client_port}/raw-data/exports/{exportname}""" # disconnected download portion from this endpoint because when there will be multiple hits at a same time we don't want function to get stuck waiting for user to download the file and deliver the response , we want to reduce waiting time and free function ! 
-    response_time=time.time() - start_time
-    zip_file_size=os.path.getsize(zip_temp_path) #getting file size of zip , units are in bytes converted to mb in response
-    logging.debug("-----Raw Data Request Took-- %s seconds -----" % (response_time))
-    if int(response_time) < 60 :
-        response_time_str=f"""{int(response_time)} Seconds"""
-    else : 
-        minute=int(response_time/60)
-        response_time_str=f"""{minute} Minute"""
-    return {"download_url": download_url, "file_name": exportname, "response_time": response_time_str, "query_area" : f"""{geom_area} Sq Km ""","binded_file_size":f"""{Binded_file_size/1000000} MB""" , "zip_file_size":zip_file_size}
 
-@router.get("/status/")    
-def check_current_db_status():
-    """Gives status about DB update, Substracts with current time and last db update time"""
-    result= RawData().check_status()
-    if int(result) == 0:
-        response = "Less than a Minute ago"
-    else:
-        response = f"""{int(result)} Minute ago"""    
-    return {"last_updated": response}
+@router.get("/countries/", response_model=FeatureCollection)
+@version(1)
+def get_countries(q: str = ""):
+    result = RawData().get_countries_list(q)
+    return result
+
+
+@router.get("/osm_id/", response_model=FeatureCollection)
+@version(1)
+def get_osm_feature(osm_id: int):
+    return RawData().get_osm_feature(osm_id)
